@@ -1,7 +1,76 @@
-﻿.DS_Store
-node_modules
-.dist
-dist
-build
+﻿# --- OS / 에디터 ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# --- 로그 / 캐시 ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 *.log
-.env*
+*.tsbuildinfo
+.cache/
+.tmp/
+temp/
+tmp/
+
+# --- Node / 패키지 매니저 ---
+node_modules/
+.pnpm-store/
+.pnp.cjs
+.pnp.data.json
+.pnp.loader.mjs
+
+# --- 빌드 산출물 ---
+dist/
+build/
+coverage/
+.out/
+out/
+.next/
+.next-static/
+.vercel/
+.turbo/
+.vite/
+
+# --- Next.js / 프레임워크별 ---
+# Next (apps/web)
+apps/web/.next/
+apps/web/out/
+apps/web/.vercel/
+
+# --- 테스트 ---
+coverage/
+.junit/
+.jest/
+__tests__/coverage/
+playwright-report/
+test-results/
+
+# --- 환경 변수 / 비밀 ---
+.env
+.env.*
+!.env.example
+
+# --- 이미지/에셋 중 대용량 결과물(필요 시) ---
+*.zip
+*.tar
+*.tar.gz
+
+# --- IDE별 잡파일 ---
+*.iml
+*.ipr
+*.iws
+
+# --- OS별 휴지통 ---
+$RECYCLE.BIN/
+
+# --- 기타 생성물 ---
+*.pid
+*.seed
