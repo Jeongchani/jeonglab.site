@@ -1,16 +1,11 @@
 {
-  "name": "jeong.site",
+  "name": "jeonglab.site",
   "private": true,
   "version": "0.0.1",
   "packageManager": "pnpm@9.12.1",
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
   "scripts": {
-    "dev": "echo \"(placeholder) apps/web dev will run here later\"",
-    "build": "echo \"(placeholder) monorepo build\"",
-    "lint": "echo \"(placeholder) monorepo lint\"",
-    "typecheck": "echo \"(placeholder) monorepo typecheck\""
+    "dev": "pnpm --filter web dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter web start"
   }
 }
