@@ -1,0 +1,22 @@
+services:
+  jeongsite-api:
+    build:
+      context: ./jeonglab.site/api
+    image: jeongsite-api:1
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - LINKS_FILE=/data/links.json
+    volumes:
+      - jeongsite-links:/data
+    networks:
+      - internal
+
+volumes:
+  jeongsite-links:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge

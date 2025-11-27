@@ -25,8 +25,21 @@ const CHIP_LABELS: Record<SelectedCategory, string> = {
 type PanelMode = "closed" | "create" | "edit";
 
 const AUTH_KEY = "jeongsite_admin_v1";
-const ADMIN_PASSWORD = "change-this-password"; // 👉 너가 원하는 걸로 바꿔 써
-const LINKS_STORAGE_KEY = "jeongsite_links_v1";
+// ⚠️ 프론트에서만 쓰는 관리자 비밀번호 (진짜 보안은 Cloudflare/Tailscale로)
+const ADMIN_PASSWORD = "change-this-password";
+
+// 개발(로컬)에서는 4000 포트, 배포에서는 동일 오리진(/api)
+const API_BASE =
+  typeof window !== "undefined" &&
+  (window.location.hostname === "localhost" ||
+    window.location.hostname === "127.0.0.1")
+    ? "http://localhost:4000"
+    : "";
+
+// API 요청용 유틸
+function apiUrl(path: string): string {
+  return (API_BASE || "") + path;
+}
 
 interface AppState {
   links: LinkItem[];
@@ -37,6 +50,8 @@ interface AppState {
   isAuthed: boolean;
   loginPanelOpen: boolean;
   backupPanelOpen: boolean;
+  isLoading: boolean;
+  isSaving: boolean;
 }
 
 export function initApp(root: HTMLElement, initialLinks: LinkItem[]) {
@@ -49,25 +64,21 @@ export function initApp(root: HTMLElement, initialLinks: LinkItem[]) {
     // ignore
   }
 
-  const initial = loadInitialLinks(initialLinks);
-
   let state: AppState = {
-    links: initial,
+    links: sortLinks(initialLinks),
     selected: "All",
     isEditing: false,
     panelMode: "closed",
     panelTargetId: null,
     isAuthed: isAuthedInitial,
     loginPanelOpen: false,
-    backupPanelOpen: false
+    backupPanelOpen: false,
+    isLoading: false,
+    isSaving: false
   };
 
   const setState = (patch: Partial<AppState>) => {
-    const hadLinksPatch = Object.prototype.hasOwnProperty.call(patch, "links");
     state = { ...state, ...patch };
-    if (hadLinksPatch) {
-      persistLinks(state.links);
-    }
     render();
   };
 
@@ -78,32 +89,39 @@ export function initApp(root: HTMLElement, initialLinks: LinkItem[]) {
   };
 
   render();
-}
 
-// ---------- 저장/로드 ----------
-
-function loadInitialLinks(initialLinks: LinkItem[]): LinkItem[] {
-  try {
-    if (typeof window === "undefined") return sortLinks(initialLinks);
-    const raw = window.localStorage.getItem(LINKS_STORAGE_KEY);
-    if (!raw) return sortLinks(initialLinks);
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return sortLinks(initialLinks);
-    return sortLinks(parsed as LinkItem[]);
-  } catch {
-    return sortLinks(initialLinks);
+  // 첫 렌더 후 서버에서 최신 링크 불러오기
+  if (typeof window !== "undefined") {
+    void syncLinksFromServer(setState);
   }
 }
 
-function persistLinks(links: LinkItem[]) {
+// 서버에서 링크 가져오기
+async function syncLinksFromServer(
+  setState: (patch: Partial<AppState>) => void
+) {
+  if (typeof fetch === "undefined") return;
+  setState({ isLoading: true });
   try {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(LINKS_STORAGE_KEY, JSON.stringify(links));
-  } catch {
-    // ignore
+    const res = await fetch(apiUrl("/api/links"));
+    if (!res.ok) {
+      console.warn("Failed to load links from API:", res.status);
+      return;
+    }
+    const data = await res.json();
+    if (Array.isArray(data)) {
+      setState({ links: sortLinks(data as LinkItem[]) });
+    } else {
+      console.warn("API /api/links did not return array");
+    }
+  } catch (err) {
+    console.warn("Error fetching /api/links:", err);
+  } finally {
+    setState({ isLoading: false });
   }
 }
 
+// 정렬 기준: pinned 우선 + order + category
 function sortLinks(list: LinkItem[]): LinkItem[] {
   return [...list].sort((a, b) => {
     // 1) pinned 먼저
@@ -112,22 +130,20 @@ function sortLinks(list: LinkItem[]): LinkItem[] {
     const ao = a.order ?? 0;
     const bo = b.order ?? 0;
 
-    // 2) pinned 끼리는 order만으로 정렬 (카테고리 상관 X)
+    // 2) pinned 끼리는 order만
     if (a.pinned && b.pinned) {
       if (ao !== bo) return ao - bo;
-      return a.title.localeCompare(b.title, "ko");
+      return (a.title || "").localeCompare(b.title || "", "ko");
     }
 
-    // 3) 나머지는 카테고리→order→제목 순
+    // 3) 나머지: category → order → title
     if (a.category !== b.category) {
-      return a.category.localeCompare(b.category);
+      return (a.category || "").localeCompare(b.category || "");
     }
     if (ao !== bo) return ao - bo;
-    return a.title.localeCompare(b.title, "ko");
+    return (a.title || "").localeCompare(b.title || "", "ko");
   });
 }
-
-// ---------- 렌더링 ----------
 
 function buildAppHtml(state: AppState): string {
   const {
@@ -139,8 +155,11 @@ function buildAppHtml(state: AppState): string {
     isAuthed,
     loginPanelOpen,
     backupPanelOpen
+    // isLoading,
+    // isSaving
   } = state;
 
+  // 로그인 여부에 따라 private 표시 여부 결정
   const baseLinks = isAuthed
     ? links
     : links.filter((l) => l.visibility === "public");
@@ -187,7 +206,6 @@ function buildAppHtml(state: AppState): string {
   const loginPanelHtml = buildLoginPanel(state);
   const backupPanelHtml = buildBackupPanel(state);
 
-  // 헤더 버튼 영역
   let headerActionsHtml = "";
 
   if (!isAuthed) {
@@ -315,7 +333,7 @@ function renderCard(link: LinkItem, isEditing: boolean): string {
   const iconText = renderIconText(link.icon);
 
   if (isEditing) {
-    // 편집 모드: 카드가 div + draggable
+    // 편집 모드: div + draggable
     return `
       <div
         class="card card-editable"
@@ -336,7 +354,6 @@ function renderCard(link: LinkItem, isEditing: boolean): string {
     `;
   }
 
-  // 일반 모드: 실제 링크
   return `
     <a class="card" href="${url}" target="_blank" rel="noreferrer">
       <div class="card-icon">${iconText}</div>
@@ -352,7 +369,6 @@ function renderCard(link: LinkItem, isEditing: boolean): string {
   `;
 }
 
-
 function renderIconText(icon: string): string {
   if (icon.startsWith("emoji:")) {
     const parts = icon.split("emoji:");
@@ -366,8 +382,6 @@ function renderIconText(icon: string): string {
   }
   return "🔗";
 }
-
-// ---------- 편집 패널 ----------
 
 function buildEditPanel(state: AppState, current: LinkItem | null): string {
   const { panelMode, selected } = state;
@@ -537,8 +551,6 @@ function buildEditPanel(state: AppState, current: LinkItem | null): string {
   `;
 }
 
-// ---------- 로그인 패널 ----------
-
 function buildLoginPanel(state: AppState): string {
   const { loginPanelOpen, isAuthed } = state;
   if (!loginPanelOpen || isAuthed) return "";
@@ -591,8 +603,6 @@ function buildLoginPanel(state: AppState): string {
   `;
 }
 
-// ---------- 백업 패널 ----------
-
 function buildBackupPanel(state: AppState): string {
   const { backupPanelOpen, isAuthed } = state;
   if (!backupPanelOpen || !isAuthed) return "";
@@ -613,8 +623,8 @@ function buildBackupPanel(state: AppState): string {
       <div class="edit-panel-body">
         <div class="edit-panel-row">
           <p class="edit-label">
-            현재 브라우저에 저장된 링크 상태를 JSON 파일로 내보내거나,
-            JSON 파일을 불러와서 복원할 수 있습니다.
+            현재 <strong>서버에 저장된 링크 상태</strong>를 JSON 파일로 내보내거나,
+            JSON 파일을 불러와서 서버 상태를 복원할 수 있습니다.
           </p>
         </div>
 
@@ -632,7 +642,7 @@ function buildBackupPanel(state: AppState): string {
               class="btn-ghost-sm"
               data-role="backup-reset"
             >
-              초기화
+              전체 초기화
             </button>
             <button
               type="button"
@@ -648,14 +658,14 @@ function buildBackupPanel(state: AppState): string {
   `;
 }
 
-// ---------- 이벤트 핸들러 ----------
+// --------------------- 이벤트 바인딩 ---------------------
 
 function attachHandlers(
   root: HTMLElement,
   state: AppState,
   setState: (patch: Partial<AppState>) => void
 ) {
-  // ----- 카테고리 칩 -----
+  // 카테고리 칩
   const chips = root.querySelectorAll<HTMLButtonElement>(
     "[data-role='category-chip']"
   );
@@ -668,7 +678,7 @@ function attachHandlers(
     });
   });
 
-  // ----- 편집 토글 -----
+  // 편집 토글
   const editToggle = root.querySelector<HTMLButtonElement>(
     "[data-role='toggle-edit']"
   );
@@ -684,7 +694,7 @@ function attachHandlers(
     });
   }
 
-  // ----- 새 링크 추가 -----
+  // 새 링크 추가
   const addBtn = root.querySelector<HTMLButtonElement>(
     "[data-role='add-link']"
   );
@@ -699,7 +709,7 @@ function attachHandlers(
     });
   }
 
-  // ----- 드래그 정렬 -----
+  // 드래그 정렬
   let dragSrcId: string | null = null;
 
   const dragCards = root.querySelectorAll<HTMLElement>(
@@ -746,11 +756,12 @@ function attachHandlers(
       const next = reorderLinksByDrag(state.links, fromId, toId);
       if (next !== state.links) {
         setState({ links: next });
+        void syncReorderToServer(fromId, toId);
       }
     });
   });
 
-  // ----- 카드 클릭 → 편집 패널 -----
+  // 카드 클릭 → 편집 패널
   const editTargets = root.querySelectorAll<HTMLElement>(
     "[data-role='edit-link']"
   );
@@ -767,7 +778,7 @@ function attachHandlers(
     });
   });
 
-  // ----- 편집 패널 닫기 -----
+  // 편집 패널 닫기
   const closeBtns = root.querySelectorAll<HTMLButtonElement>(
     "[data-role='panel-close']"
   );
@@ -780,26 +791,26 @@ function attachHandlers(
     });
   });
 
-  // ----- 편집 저장 -----
+  // 편집 저장
   const form = root.querySelector<HTMLFormElement>("[data-role='edit-form']");
   if (form) {
     form.addEventListener("submit", (e) => {
       e.preventDefault();
-      handleSave(form, state, setState);
+      void handleSave(form, state, setState);
     });
   }
 
-  // ----- 편집 삭제 -----
+  // 편집 삭제
   const delBtn = root.querySelector<HTMLButtonElement>(
     "[data-role='panel-delete']"
   );
   if (delBtn) {
     delBtn.addEventListener("click", () => {
-      handleDelete(state, setState);
+      void handleDelete(state, setState);
     });
   }
 
-  // ----- 로그인 패널 열기 -----
+  // 로그인 패널 열기
   const openLogin = root.querySelector<HTMLButtonElement>(
     "[data-role='open-login']"
   );
@@ -875,7 +886,7 @@ function attachHandlers(
     });
   });
 
-  // JSON 내보내기
+  // JSON 내보내기 (현재 state.links를 파일로)
   const backupExportBtn = root.querySelector<HTMLButtonElement>(
     "[data-role='backup-export']"
   );
@@ -885,7 +896,7 @@ function attachHandlers(
     });
   }
 
-  // JSON 가져오기
+  // JSON 가져오기 → 서버에 반영
   const backupImportBtn = root.querySelector<HTMLButtonElement>(
     "[data-role='backup-import']"
   );
@@ -906,11 +917,7 @@ function attachHandlers(
               alert("JSON 최상위는 배열이어야 합니다.");
               return;
             }
-            const links = sortLinks(parsed as LinkItem[]);
-            setState({
-              links,
-              backupPanelOpen: false
-            });
+            void syncBackupImport(parsed as LinkItem[], setState);
           } catch {
             alert("JSON 파싱에 실패했습니다.");
           }
@@ -921,30 +928,24 @@ function attachHandlers(
     });
   }
 
-  // 로컬 상태 초기화
+  // 서버 데이터 전체 초기화 (빈 배열로 덮어쓰기)
   const backupResetBtn = root.querySelector<HTMLButtonElement>(
     "[data-role='backup-reset']"
   );
   if (backupResetBtn) {
     backupResetBtn.addEventListener("click", () => {
       const ok = window.confirm(
-        "이 브라우저에 저장된 변경 사항을 모두 지우고 초기 상태로 되돌릴까요?"
+        "서버에 저장된 모든 링크를 삭제하고 빈 상태로 초기화할까요?\n(백업 JSON이 없다면 되돌릴 수 없습니다)"
       );
       if (!ok) return;
-      try {
-        window.localStorage.removeItem(LINKS_STORAGE_KEY);
-      } catch {
-        // ignore
-      }
-      window.location.reload();
+      void syncBackupImport([], setState);
     });
   }
 }
 
+// --------------------- 로직 ---------------------
 
-// ---------- 로직 ----------
-
-function handleSave(
+async function handleSave(
   form: HTMLFormElement,
   state: AppState,
   setState: (patch: Partial<AppState>) => void
@@ -960,7 +961,8 @@ function handleSave(
     "public") as "public" | "private";
   const orderRaw = String(fd.get("order") ?? "").trim();
 
-  const order = orderRaw === "" ? undefined : Number(orderRaw);
+  const order =
+    orderRaw === "" ? undefined : Number(orderRaw);
   const pinned =
     form.querySelector<HTMLInputElement>("input[name='pinned']")?.checked ??
     false;
@@ -970,67 +972,73 @@ function handleSave(
     return;
   }
 
-  const now = new Date().toISOString();
+  const payload = {
+    title,
+    url,
+    category: categoryStr,
+    icon: icon || undefined,
+    notes: notes || undefined,
+    pinned,
+    visibility,
+    order
+  };
 
-  if (state.panelMode === "create") {
-    const maxOrder =
-      state.links.length > 0
-        ? Math.max(...state.links.map((l) => l.order ?? 0))
-        : 0;
+  setState({ isSaving: true });
 
-    const newLink: LinkItem = {
-      id: generateId(title, state.links),
-      title,
-      url,
-      icon: icon || "emoji:🔗",
-      category: categoryStr,
-      pinned,
-      notes: notes || undefined,
-      order: order ?? maxOrder + 10,
-      createdAt: now,
-      updatedAt: now,
-      visibility
-    };
+  try {
+    if (state.panelMode === "create") {
+      const res = await fetch(apiUrl("/api/links"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        alert("링크 생성에 실패했습니다.");
+        console.error("POST /api/links failed:", res.status);
+        return;
+      }
+      const created = (await res.json()) as LinkItem;
+      const nextLinks = sortLinks([...state.links, created]);
+      setState({
+        links: nextLinks,
+        panelMode: "closed",
+        panelTargetId: null
+      });
+      return;
+    }
 
-    const nextLinks = sortLinks([...state.links, newLink]);
-    setState({
-      links: nextLinks,
-      panelMode: "closed",
-      panelTargetId: null
-    });
-    return;
-  }
-
-  if (state.panelMode === "edit" && state.panelTargetId) {
-    const current = state.links.find((l) => l.id === state.panelTargetId);
-    if (!current) return;
-
-    const updated: LinkItem = {
-      ...current,
-      title,
-      url,
-      icon: icon || current.icon,
-      category: categoryStr,
-      pinned,
-      notes: notes || undefined,
-      order: order ?? current.order,
-      visibility,
-      updatedAt: now
-    };
-
-    const nextLinks = sortLinks(
-      state.links.map((l) => (l.id === current.id ? updated : l))
-    );
-
-    setState({
-      links: nextLinks,
-      panelMode: "closed",
-      panelTargetId: null
-    });
+    if (state.panelMode === "edit" && state.panelTargetId) {
+      const id = state.panelTargetId;
+      const res = await fetch(apiUrl(`/api/links/${encodeURIComponent(id)}`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        alert("링크 수정에 실패했습니다.");
+        console.error("PUT /api/links/:id failed:", res.status);
+        return;
+      }
+      const updated = (await res.json()) as LinkItem;
+      const nextLinks = sortLinks(
+        state.links.map((l) => (l.id === updated.id ? updated : l))
+      );
+      setState({
+        links: nextLinks,
+        panelMode: "closed",
+        panelTargetId: null
+      });
+      return;
+    }
+  } catch (err) {
+    alert("서버 요청 중 오류가 발생했습니다.");
+    console.error("handleSave error:", err);
+  } finally {
+    setState({ isSaving: false });
   }
 }
 
-function handleDelete(
+async function handleDelete(
   state: AppState,
   setState: (patch: Partial<AppState>) => void
 ) {
@@ -1043,12 +1051,32 @@ function handleDelete(
   );
   if (!ok) return;
 
-  const nextLinks = state.links.filter((l) => l.id !== target.id);
-  setState({
-    links: sortLinks(nextLinks),
-    panelMode: "closed",
-    panelTargetId: null
-  });
+  setState({ isSaving: true });
+
+  try {
+    const res = await fetch(
+      apiUrl(`/api/links/${encodeURIComponent(target.id)}`),
+      {
+        method: "DELETE"
+      }
+    );
+    if (res.status !== 204) {
+      alert("삭제에 실패했습니다.");
+      console.error("DELETE /api/links/:id failed:", res.status);
+      return;
+    }
+    const nextLinks = state.links.filter((l) => l.id !== target.id);
+    setState({
+      links: sortLinks(nextLinks),
+      panelMode: "closed",
+      panelTargetId: null
+    });
+  } catch (err) {
+    alert("서버 요청 중 오류가 발생했습니다.");
+    console.error("handleDelete error:", err);
+  } finally {
+    setState({ isSaving: false });
+  }
 }
 
 function handleLogin(
@@ -1080,61 +1108,7 @@ function handleLogin(
   });
 }
 
-// JSON 내보내기
-function exportLinks(links: LinkItem[]) {
-  try {
-    const data = JSON.stringify(links, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "jeongsite-links-backup.json";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  } catch {
-    alert("JSON 내보내기 중 오류가 발생했습니다.");
-  }
-}
-
-// ---------- 유틸 ----------
-
-function generateId(title: string, existing: LinkItem[]): string {
-  const base =
-    "link-" +
-    title
-      .toLowerCase()
-      .replace(/[^a-z0-9가-힣]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 40);
-
-  const ids = new Set(existing.map((l) => l.id));
-  if (!ids.has(base)) return base;
-
-  let i = 2;
-  while (ids.has(`${base}-${i}`)) {
-    i++;
-  }
-  return `${base}-${i}`;
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeAttr(str: string): string {
-  return escapeHtml(str).replace(/"/g, "&quot;");
-}
-
-function escapeHtmlTextArea(str: string): string {
-  return escapeHtml(str);
-}
-
-// 드래그로 순서 재배치
+// 드래그로 순서 재배치 (프론트 로컬)
 function reorderLinksByDrag(
   list: LinkItem[],
   fromId: string,
@@ -1149,22 +1123,22 @@ function reorderLinksByDrag(
   let groupFn: (l: LinkItem) => boolean;
 
   if (from.pinned) {
-    // pinned 그룹 전체에서 재정렬 (카테고리 무시)
     if (!to.pinned) return list;
     groupFn = (l) => l.pinned;
   } else {
-    // 일반 링크는 같은 카테고리 안에서만
     if (to.pinned || from.category !== to.category) return list;
     const cat = from.category;
     groupFn = (l) => !l.pinned && l.category === cat;
   }
 
-  const group = list.filter(groupFn).sort((a, b) => {
-    const ao = a.order ?? 0;
-    const bo = b.order ?? 0;
-    if (ao !== bo) return ao - bo;
-    return a.title.localeCompare(b.title, "ko");
-  });
+  const group = list
+    .filter(groupFn)
+    .sort((a, b) => {
+      const ao = a.order ?? 0;
+      const bo = b.order ?? 0;
+      if (ao !== bo) return ao - bo;
+      return (a.title || "").localeCompare(b.title || "", "ko");
+    });
 
   const ids = group.map((l) => l.id);
   const fromIdx = ids.indexOf(fromId);
@@ -1184,4 +1158,82 @@ function reorderLinksByDrag(
   );
 
   return sortLinks(next);
+}
+
+// 드래그 순서 서버 반영
+async function syncReorderToServer(fromId: string, toId: string) {
+  try {
+    const res = await fetch(apiUrl("/api/links/reorder"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromId, toId })
+    });
+    if (!res.ok) {
+      console.warn("Failed to sync reorder:", res.status);
+    }
+  } catch (err) {
+    console.warn("Error syncing reorder:", err);
+  }
+}
+
+// 서버 백업 import (비우기 포함)
+async function syncBackupImport(
+  links: LinkItem[],
+  setState: (patch: Partial<AppState>) => void
+) {
+  try {
+    const res = await fetch(apiUrl("/api/backup/import"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(links)
+    });
+    if (!res.ok) {
+      alert("백업 복원에 실패했습니다.");
+      console.error("POST /api/backup/import failed:", res.status);
+      return;
+    }
+    setState({
+      links: sortLinks(links),
+      backupPanelOpen: false
+    });
+  } catch (err) {
+    alert("서버 요청 중 오류가 발생했습니다.");
+    console.error("syncBackupImport error:", err);
+  }
+}
+
+// JSON 내보내기 (클라이언트에서 파일 다운로드)
+function exportLinks(links: LinkItem[]) {
+  try {
+    const data = JSON.stringify(links, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "jeongsite-links-backup.json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert("JSON 내보내기 중 오류가 발생했습니다.");
+    console.error("exportLinks error:", err);
+  }
+}
+
+// --------------------- 유틸 ---------------------
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escapeAttr(str: string): string {
+  return escapeHtml(str).replace(/"/g, "&quot;");
+}
+
+function escapeHtmlTextArea(str: string): string {
+  return escapeHtml(str);
 }
